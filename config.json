@@ -1,0 +1,49 @@
+{
+  "assemblyai": {
+    "api_key": "in_env",
+    "sample_rate": 16000,
+    "word_boost": [],
+    "boost_param": "high"
+  },
+  "keybinds": {
+    "ptt": "leftshift+rightshift",
+    "start_transcription": "cmd+shift+space",
+    "stop_transcription": "cmd+shift+x",
+    "toggle_transcription": "cmd+shift+t",
+    "clear_buffer": "cmd+shift+c"
+  },
+  "word_joiners": ["/", "-", ":", "@", "#"],
+  "phrase_replacements": {
+    "forward slash": "/",
+    "backslash": "\\",
+    "colon": ":",
+    "dot": "."
+  },
+  "word_replacements": {
+    "slash": "/",
+    "slush": "/",
+    "flash": "/"
+  },
+  "typing": {
+    "delay_ms": 5,
+    "use_word_boundaries": true,
+    "auto_punctuation": false
+  },
+  "session": {
+    "cooldown_seconds": 0.5,
+    "auto_restart_on_error": true,
+    "max_retry_attempts": 3,
+    "retry_delay_seconds": 2
+  },
+  "audio": {
+    "chunk_size": 3200,
+    "input_device": null,
+    "auto_gain_control": true
+  },
+  "advanced": {
+    "enable_ai_enhancement": false,
+    "ai_enhancement_prompt": "Clean up this transcription, fix grammar and add punctuation:",
+    "buffer_size": 1000,
+    "processing_interval_ms": 30
+  }
+}
