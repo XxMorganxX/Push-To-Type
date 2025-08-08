@@ -24,9 +24,14 @@ class PTTKeybind:
         """Check if current pressed keys match this keybind."""
         # For modifier-only keybinds (like leftshift+rightshift), we need EXACT match
         if not self.key and not self.char:
-            # Must have exactly the required modifiers and current key must be one of them
-            return (self.modifiers == pressed_keys and 
-                    current_key in self.modifiers)
+            # All required modifiers must be pressed
+            if not all(mod in pressed_keys for mod in self.modifiers):
+                return False
+            # Current key must be one of the required modifiers
+            if current_key not in self.modifiers:
+                return False
+            # All modifiers must now be present
+            return all(mod in pressed_keys for mod in self.modifiers)
         
         # For keybinds with a trigger key
         # Check if all required modifiers are pressed
@@ -43,9 +48,9 @@ class PTTKeybind:
     
     def is_still_held(self, pressed_keys: Set) -> bool:
         """Check if the keybind is still being held."""
-        # For modifier-only keybinds, require exact match
+        # For modifier-only keybinds, all modifiers must still be pressed
         if not self.key and not self.char:
-            return self.modifiers == pressed_keys
+            return all(mod in pressed_keys for mod in self.modifiers)
         
         # For keybinds with trigger keys, all modifiers must still be pressed
         return all(mod in pressed_keys for mod in self.modifiers)
@@ -70,6 +75,15 @@ class PTTKeybindManager:
         # Track the specific key combination that triggered PTT
         self.active_trigger_keys: Set = set()
         
+        # Track shift keys specifically for better handling
+        self.left_shift_pressed = False
+        self.right_shift_pressed = False
+        
+        # Auto-recovery monitoring
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._stop_monitor = threading.Event()
+        self._last_event_time = time.time()
+        
     def register_ptt(self, keybind: PTTKeybind, 
                     on_press: Callable, 
                     on_release: Callable):
@@ -90,14 +104,23 @@ class PTTKeybindManager:
         if self.listener:
             self.stop()
             
+        self._last_event_time = time.time()
         self.listener = keyboard.Listener(
             on_press=self._on_press,
             on_release=self._on_release
         )
         self.listener.start()
+        
+        # Start monitor thread
+        if not self._monitor_thread or not self._monitor_thread.is_alive():
+            self._stop_monitor.clear()
+            self._monitor_thread = threading.Thread(target=self._monitor_listener, daemon=True)
+            self._monitor_thread.start()
     
     def stop(self):
         """Stop listening for keyboard events."""
+        self._stop_monitor.set()
+        
         if self.listener:
             # If PTT is active, release it first
             if self.ptt_state == PTTState.PRESSED:
@@ -105,6 +128,10 @@ class PTTKeybindManager:
             
             self.listener.stop()
             self.listener = None
+        
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=1.0)
+        
         self.reset_state()
     
     def reset_state(self):
@@ -113,32 +140,74 @@ class PTTKeybindManager:
             self.pressed_keys.clear()
             self.active_trigger_keys.clear()
             self.ptt_state = PTTState.IDLE
+            self.left_shift_pressed = False
+            self.right_shift_pressed = False
     
     def _on_press(self, key):
         """Handle key press events."""
+        self._last_event_time = time.time()
+        
         with self._lock:
+            # Track shift keys specifically
+            if key in (keyboard.Key.shift_l, keyboard.Key.shift):
+                self.left_shift_pressed = True
+            elif key == keyboard.Key.shift_r:
+                self.right_shift_pressed = True
+            
             # Add key to pressed set
             self.pressed_keys.add(key)
             
             # Only trigger if not already pressed
             if self.ptt_state == PTTState.IDLE:
-                if self.ptt_keybind and self.ptt_keybind.matches(self.pressed_keys, key):
+                # Special handling for left+right shift combination
+                if (self.ptt_keybind and 
+                    keyboard.Key.shift_l in self.ptt_keybind.modifiers and 
+                    keyboard.Key.shift_r in self.ptt_keybind.modifiers):
+                    # Check if both shifts are pressed
+                    if self.left_shift_pressed and self.right_shift_pressed:
+                        self.active_trigger_keys = {keyboard.Key.shift_l, keyboard.Key.shift_r}
+                        self._trigger_press()
+                elif self.ptt_keybind and self.ptt_keybind.matches(self.pressed_keys, key):
                     # Record which keys triggered the PTT
                     self.active_trigger_keys = self.pressed_keys.copy()
                     self._trigger_press()
     
     def _on_release(self, key):
         """Handle key release events."""
+        self._last_event_time = time.time()
+        
         with self._lock:
+            # Track shift key releases
+            shift_released = False
+            if key in (keyboard.Key.shift_l, keyboard.Key.shift):
+                self.left_shift_pressed = False
+                shift_released = True
+            elif key == keyboard.Key.shift_r:
+                self.right_shift_pressed = False
+                shift_released = True
+            
             # Remove key from pressed set
             self.pressed_keys.discard(key)
+            # Also remove generic shift if a specific shift is released
+            if key in (keyboard.Key.shift_l, keyboard.Key.shift_r):
+                self.pressed_keys.discard(keyboard.Key.shift)
+            # Also remove specific shifts if generic shift is released
+            elif key == keyboard.Key.shift:
+                self.pressed_keys.discard(keyboard.Key.shift_l)
+                self.pressed_keys.discard(keyboard.Key.shift_r)
             
             # Check if PTT should be released
             if self.ptt_state == PTTState.PRESSED:
-                # Release if any of the trigger keys are released
-                if key in self.active_trigger_keys:
+                # Special handling for left+right shift combination
+                if (self.ptt_keybind and 
+                    keyboard.Key.shift_l in self.ptt_keybind.modifiers and 
+                    keyboard.Key.shift_r in self.ptt_keybind.modifiers):
+                    # Release if either shift is released
+                    if shift_released and (not self.left_shift_pressed or not self.right_shift_pressed):
+                        self._trigger_release()
+                # For other keybinds, use standard logic
+                elif key in self.active_trigger_keys:
                     self._trigger_release()
-                # Also release if the keybind is no longer satisfied
                 elif not self.ptt_keybind.is_still_held(self.pressed_keys):
                     self._trigger_release()
     
@@ -236,3 +305,40 @@ class PTTKeybindManager:
             return None
             
         return PTTKeybind(modifiers=modifiers, key=key, char=char)
+    
+    def _monitor_listener(self):
+        """Monitor thread that ensures the listener stays active."""
+        while not self._stop_monitor.is_set():
+            time.sleep(2.0)  # Check every 2 seconds
+            
+            try:
+                # Check if listener is dead
+                if self.listener and not getattr(self.listener, 'running', False):
+                    print("⚠️ PTTKeybindManager: Listener died, restarting...")
+                    self.listener = keyboard.Listener(
+                        on_press=self._on_press,
+                        on_release=self._on_release
+                    )
+                    self.listener.start()
+                    self._last_event_time = time.time()
+                    print("✅ PTTKeybindManager: Listener restarted")
+                
+                # Check for stale events (no events in 60+ seconds might indicate issues)
+                time_since_last = time.time() - self._last_event_time
+                if time_since_last > 60 and self.listener:
+                    print(f"🔄 PTTKeybindManager: No events for {time_since_last:.1f}s, restarting listener...")
+                    try:
+                        self.listener.stop()
+                    except Exception:
+                        pass
+                    
+                    self.listener = keyboard.Listener(
+                        on_press=self._on_press,
+                        on_release=self._on_release
+                    )
+                    self.listener.start()
+                    self._last_event_time = time.time()
+                    print("✅ PTTKeybindManager: Listener refreshed")
+                    
+            except Exception as e:
+                print(f"⚠️ PTTKeybindManager monitor error: {e}")

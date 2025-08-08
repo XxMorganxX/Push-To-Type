@@ -19,7 +19,8 @@ from dotenv import load_dotenv
 from urllib.parse import urlencode
 import websocket
 
-from core.ptt_keybind_manager import PTTKeybind
+from core.ptt_keybind_manager import PTTKeybind, PTTKeybindManager
+from core.event_tap_listener import EventTapPTTListener
 from core.unicode_injector import UnicodeInjector
 from pynput import keyboard
 
@@ -104,6 +105,10 @@ class PTTTranscriber:
         self.stop_event = threading.Event()
         self.session_id: Optional[str] = None
         self.ws_ready = threading.Event()  # Track when WebSocket is ready
+        
+        # Thread-safe audio cleanup
+        self._audio_cleanup_lock = threading.Lock()
+        self._audio_cleaned_up = False
         
         # Track transcribed text
         self.total_characters_typed = 0  # Session stats
@@ -281,8 +286,8 @@ class PTTTranscriber:
         self.state = TranscriptionState.IDLE
         self.stop_event.set()
         self.ws_ready.clear()  # WebSocket no longer ready
-        self._cleanup_audio()
-        # Pause monitor not used in word-based streaming
+        # Don't cleanup audio here - let stop_transcription handle it
+        # This prevents double-free errors
     
     def _start_audio_streaming(self):
         """Start audio streaming in a separate thread."""
@@ -297,33 +302,53 @@ class PTTTranscriber:
 
             while not self.stop_event.is_set():
                 try:
-                    if (self.audio_stream and 
-                        self.ws_app and 
-                        hasattr(self.ws_app, 'sock') and 
-                        self.ws_app.sock and 
-                        self.ws_ready.is_set()):
-                        
-                        audio_data = self.audio_stream.read(
-                            self.chunk_size, 
-                            exception_on_overflow=False
-                        )
-                        send_buffer.extend(audio_data)
+                    # Check if audio stream is valid and not cleaned up
+                    with self._audio_cleanup_lock:
+                        stream_valid = (self.audio_stream and 
+                                      not self._audio_cleaned_up and
+                                      self.ws_app and 
+                                      hasattr(self.ws_app, 'sock') and 
+                                      self.ws_app.sock and 
+                                      self.ws_ready.is_set())
+                    
+                    if stream_valid:
+                        try:
+                            audio_data = self.audio_stream.read(
+                                self.chunk_size, 
+                                exception_on_overflow=False
+                            )
+                            send_buffer.extend(audio_data)
 
-                        # Send in >= 50 ms chunks to satisfy API requirement
-                        while len(send_buffer) >= min_send_bytes:
-                            to_send = bytes(send_buffer[:min_send_bytes])
-                            del send_buffer[:min_send_bytes]
-                            self.ws_app.send(to_send, websocket.ABNF.OPCODE_BINARY)
-                            send_count += 1
+                            # Send in >= 50 ms chunks to satisfy API requirement
+                            while len(send_buffer) >= min_send_bytes:
+                                to_send = bytes(send_buffer[:min_send_bytes])
+                                del send_buffer[:min_send_bytes]
+                                
+                                # Check WebSocket is still valid before sending
+                                if (self.ws_app and hasattr(self.ws_app, 'sock') and 
+                                    self.ws_app.sock):
+                                    self.ws_app.send(to_send, websocket.ABNF.OPCODE_BINARY)
+                                    send_count += 1
 
-                            # Print a status dot roughly every 500 ms of audio sent
-                            dots_every = max(1, int(500 / self.min_send_duration_ms))
-                            if send_count % dots_every == 0:
-                                print(".", end="", flush=True)
+                                    # Print a status dot roughly every 500 ms of audio sent
+                                    dots_every = max(1, int(500 / self.min_send_duration_ms))
+                                    if send_count % dots_every == 0:
+                                        print(".", end="", flush=True)
+                                else:
+                                    break  # WebSocket closed, exit sending loop
+                        except Exception as stream_e:
+                            # Handle specific audio stream errors
+                            if not self.stop_event.is_set():
+                                print(f"\n❌ Audio stream error: {stream_e}")
+                            break
+                    else:
+                        # Stream not valid, but check if we should continue waiting
+                        if not self.stop_event.is_set():
+                            time.sleep(0.01)  # Small delay to prevent tight loop
                         
                 except Exception as e:
                     if not self.stop_event.is_set():
-                        print(f"\n❌ Error streaming audio: {e}")
+                        print(f"\n❌ Error in audio streaming loop: {e}")
                     break
 
             # Flush any remaining audio, padding to minimum duration if needed
@@ -350,6 +375,10 @@ class PTTTranscriber:
         try:
             self.state = TranscriptionState.CONNECTING
             print("🔄 Starting transcription session...")
+            
+            # Reset audio cleanup flag for new session
+            with self._audio_cleanup_lock:
+                self._audio_cleaned_up = False
             
             # Open microphone stream
             print("🎙️ Opening microphone...")
@@ -439,16 +468,43 @@ class PTTTranscriber:
         self.session_text = ""
         self.stop_event.clear()  # Reset for next session
         
+        # Reset audio cleanup flag for next session
+        with self._audio_cleanup_lock:
+            self._audio_cleaned_up = False
+        
         self.state = TranscriptionState.IDLE
         print("✅ Transcription stopped")
     
     def _cleanup_audio(self):
-        """Clean up audio resources."""
-        if self.audio_stream:
-            if self.audio_stream.is_active():
-                self.audio_stream.stop_stream()
-            self.audio_stream.close()
-            self.audio_stream = None
+        """Clean up audio resources - thread-safe and idempotent."""
+        with self._audio_cleanup_lock:
+            # Check if already cleaned up
+            if self._audio_cleaned_up:
+                return
+            
+            # Mark as cleaned up first to prevent race conditions
+            self._audio_cleaned_up = True
+            
+            # Clean up audio stream
+            if self.audio_stream:
+                try:
+                    # Check if stream is active before stopping
+                    if self.audio_stream.is_active():
+                        try:
+                            self.audio_stream.stop_stream()
+                        except Exception as e:
+                            print(f"⚠️ Error stopping audio stream: {e}")
+                    
+                    # Close the stream
+                    try:
+                        self.audio_stream.close()
+                    except Exception as e:
+                        print(f"⚠️ Error closing audio stream: {e}")
+                    
+                except Exception as e:
+                    print(f"⚠️ Error during audio cleanup: {e}")
+                finally:
+                    self.audio_stream = None
     
     def cleanup(self):
         """Clean up all resources."""
@@ -469,13 +525,19 @@ class PushToTalkApp:
         self.transcriber: Optional[PTTTranscriber] = None
         self.is_transcribing = False
         
-        # Direct keyboard handling like debug script
-        self.pressed_keys = set()
-        self.keyboard_listener: Optional[keyboard.Listener] = None
+        # Keybind manager (default) and Quartz fallback
+        self.kbm: Optional[PTTKeybindManager] = None
+        self.quartz_listener: Optional[EventTapPTTListener] = None
+        self.keyboard_listener: Optional[keyboard.Listener] = None  # legacy; no longer used
         self.ptt_keybind = PTTKeybind(
             modifiers={keyboard.Key.shift_l, keyboard.Key.shift_r}
         )
         self.ptt_active = False
+        self.ptt_pressed_at: Optional[float] = None
+        # Listener watchdog to ensure long-running reliability
+        self.listener_watchdog_thread: Optional[threading.Thread] = None
+        self.listener_watchdog_stop = threading.Event()
+        self.listener_restart_lock = threading.Lock()
         print(f"Debug: Created keybind with modifiers: {self.ptt_keybind.modifiers}")
         
     def _load_config(self, config_path: str) -> dict:
@@ -490,16 +552,121 @@ class PushToTalkApp:
             return json.load(f)
     
     def _setup_ptt(self):
-        """Configure push-to-talk keybind using direct keyboard listener."""
+        """Configure push-to-talk keybind using PTTKeybindManager with watchdog."""
         print("📍 Push-to-Talk configured: Both Shift Keys (left + right)")
         print(f"   Keybind modifiers: {self.ptt_keybind.modifiers}")
+        # Start keybind manager
+        try:
+            self.kbm = PTTKeybindManager()
+            self.kbm.register_ptt(self.ptt_keybind, self._on_ptt_press, self._on_ptt_release)
+            self.kbm.start()
+            print("🔁 PTTKeybindManager started")
+        except Exception as e:
+            print(f"❌ Failed to start PTTKeybindManager: {e}")
+        # Start Quartz event tap listener as a redundancy if desired
+        try:
+            self.quartz_listener = EventTapPTTListener(self._on_ptt_press, self._on_ptt_release, require_left_right_shift=True)
+            self.quartz_listener.start()
+            print("🧲 Quartz event tap listener started")
+        except Exception as e:
+            print(f"⚠️ Failed to start Quartz event tap listener: {e}")
+        # Start watchdog
+        if not self.listener_watchdog_thread or not self.listener_watchdog_thread.is_alive():
+            self.listener_watchdog_stop.clear()
+            self.listener_watchdog_thread = threading.Thread(target=self._watch_keyboard_listener, daemon=True)
+            self.listener_watchdog_thread.start()
+
+    def _restart_key_listener(self):
+        with self.listener_restart_lock:
+            try:
+                if self.kbm:
+                    self.kbm.stop()
+            except Exception:
+                pass
+            try:
+                if self.kbm:
+                    self.kbm.reset_state()
+                    self.kbm.start()
+                    print("🔁 Key listener restarted")
+            except Exception as e:
+                print(f"❌ Failed to restart key listener: {e}")
+
+    def _watch_keyboard_listener(self):
+        """Watchdog that restarts the keyboard listener if it dies and handles stuck PTT."""
+        stuck_threshold_s = 10.0
+        check_interval = 3.0  # Check more frequently
+        last_quartz_restart = 0
         
-        # Start direct keyboard listener
-        self.keyboard_listener = keyboard.Listener(
-            on_press=self._on_key_press,
-            on_release=self._on_key_release
-        )
-        self.keyboard_listener.start()
+        while not self.listener_watchdog_stop.is_set():
+            time.sleep(check_interval)
+            try:
+                # Restart if listener missing or not running
+                if (self.kbm is None) or (self.kbm.listener is None) or (not getattr(self.kbm.listener, 'running', False)):
+                    print("⚠️ Keyboard listener not running; attempting restart...")
+                    self._restart_key_listener()
+                
+                # Check Quartz listener more aggressively
+                if self.quartz_listener:
+                    # Always try to ensure it's running
+                    if not self.quartz_listener.is_running():
+                        try:
+                            print("⚠️ Quartz listener not running; attempting restart...")
+                            self.quartz_listener.stop()  # Clean stop first
+                            time.sleep(0.1)
+                            self.quartz_listener.start()
+                            last_quartz_restart = time.time()
+                        except Exception as e:
+                            print(f"⚠️ Failed to restart Quartz listener: {e}")
+                            # Try creating a new instance
+                            try:
+                                self.quartz_listener = EventTapPTTListener(
+                                    self._on_ptt_press, 
+                                    self._on_ptt_release, 
+                                    require_left_right_shift=True
+                                )
+                                self.quartz_listener.start()
+                                print("✅ Created new Quartz listener instance")
+                            except Exception as e2:
+                                print(f"❌ Failed to create new Quartz listener: {e2}")
+                    
+                    # Periodically restart Quartz listener as preventive measure
+                    elif (time.time() - last_quartz_restart) > 300:  # Every 5 minutes
+                        try:
+                            print("🔄 Preventive Quartz listener restart...")
+                            self.quartz_listener.stop()
+                            time.sleep(0.1)
+                            self.quartz_listener.start()
+                            last_quartz_restart = time.time()
+                        except Exception:
+                            pass
+                
+                # Stuck PTT guard
+                if self.ptt_active and self.ptt_pressed_at is not None:
+                    if (time.time() - self.ptt_pressed_at) > stuck_threshold_s:
+                        print("⚠️ PTT appears stuck; forcing release and resetting listener state")
+                        try:
+                            self._on_ptt_release()
+                        except Exception:
+                            pass
+                        try:
+                            if self.kbm:
+                                self.kbm.reset_state()
+                        except Exception:
+                            pass
+                        self.ptt_active = False
+                        self.ptt_pressed_at = None
+                        
+                        # Also restart listeners after stuck PTT
+                        self._restart_key_listener()
+                        if self.quartz_listener:
+                            try:
+                                self.quartz_listener.stop()
+                                time.sleep(0.1)
+                                self.quartz_listener.start()
+                            except Exception:
+                                pass
+            except Exception as e:
+                print(f"⚠️ Keyboard listener watchdog error: {e}")
     
     def _on_key_press(self, key):
         """Handle key press events directly."""
@@ -530,6 +697,7 @@ class PushToTalkApp:
         print("💡 Text will appear at your cursor position!")
         print("="*60)
         
+        self.ptt_pressed_at = time.time()
         if not self.is_transcribing:
             self._start_transcription()
             # Indicator removed
@@ -540,6 +708,7 @@ class PushToTalkApp:
         print("🔴 PTT RELEASED - Stopping...")
         print("="*60)
         
+        self.ptt_pressed_at = None
         if self.is_transcribing:
             self._stop_transcription()
             # Indicator removed
@@ -644,11 +813,25 @@ class PushToTalkApp:
         if self.is_transcribing:
             self._stop_transcription()
         
-        # Stop keyboard listener
-        if self.keyboard_listener:
-            print("⌨️  Stopping keyboard listener...")
-            self.keyboard_listener.stop()
-            self.keyboard_listener = None
+        # Stop keybind manager and watchdog
+        try:
+            if self.kbm:
+                print("⌨️  Stopping keybind manager...")
+                self.kbm.stop()
+        except Exception:
+            pass
+        try:
+            if self.quartz_listener:
+                print("🧲 Stopping Quartz event tap listener...")
+                self.quartz_listener.stop()
+        except Exception:
+            pass
+        self.listener_watchdog_stop.set()
+        if self.listener_watchdog_thread and self.listener_watchdog_thread.is_alive():
+            try:
+                self.listener_watchdog_thread.join(timeout=1.0)
+            except Exception:
+                pass
         
         # Cleanup transcriber
         if self.transcriber:
