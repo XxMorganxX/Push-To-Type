@@ -6,6 +6,7 @@ from Quartz import (
     CGEventTapCreate,
     CGEventTapEnable,
     CGEventTapIsEnabled,
+    CGEventSourceKeyState,
     CFMachPortCreateRunLoopSource,
     CFRunLoopAddSource,
     CFRunLoopGetCurrent,
@@ -20,6 +21,7 @@ from Quartz import (
     kCGSessionEventTap,
     CGEventGetIntegerValueField,
     kCGKeyboardEventKeycode,
+    kCGEventSourceStateCombinedSessionState,
 )
 
 # macOS keycodes for modifier keys we care about
@@ -83,23 +85,17 @@ class EventTapPTTListener:
             CGEventTapEnable(self._tap, True)
         try:
             if type_ in (kCGEventKeyDown, kCGEventKeyUp, kCGEventFlagsChanged):
-                keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
-                # Determine action based on event type
-                def apply_key(name: str):
-                    if type_ == kCGEventKeyDown:
-                        self._pressed.add(name)
-                    elif type_ == kCGEventKeyUp:
-                        self._pressed.discard(name)
-                    else:  # kCGEventFlagsChanged toggles state
-                        if name in self._pressed:
-                            self._pressed.discard(name)
-                        else:
-                            self._pressed.add(name)
-
-                if keycode == KEYCODE_LEFT_SHIFT:
-                    apply_key("shift_l")
-                elif keycode == KEYCODE_RIGHT_SHIFT:
-                    apply_key("shift_r")
+                # Derive current physical modifier state from system, avoids missed toggles
+                left = CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, KEYCODE_LEFT_SHIFT)
+                right = CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, KEYCODE_RIGHT_SHIFT)
+                if left:
+                    self._pressed.add("shift_l")
+                else:
+                    self._pressed.discard("shift_l")
+                if right:
+                    self._pressed.add("shift_r")
+                else:
+                    self._pressed.discard("shift_r")
 
                 # Evaluate state transitions
                 self._handle_press()

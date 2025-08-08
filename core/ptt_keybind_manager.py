@@ -1,6 +1,6 @@
 import time
 import threading
-from typing import Dict, Set, Callable, Optional, Tuple
+from typing import Callable, Optional, Set
 from pynput import keyboard
 from dataclasses import dataclass
 from enum import Enum
@@ -19,46 +19,12 @@ class PTTKeybind:
     modifiers: Set[keyboard.Key]
     key: Optional[keyboard.Key] = None
     char: Optional[str] = None
-    
-    def matches(self, pressed_keys: Set, current_key) -> bool:
-        """Check if current pressed keys match this keybind."""
-        # For modifier-only keybinds (like leftshift+rightshift), we need EXACT match
-        if not self.key and not self.char:
-            # All required modifiers must be pressed
-            if not all(mod in pressed_keys for mod in self.modifiers):
-                return False
-            # Current key must be one of the required modifiers
-            if current_key not in self.modifiers:
-                return False
-            # All modifiers must now be present
-            return all(mod in pressed_keys for mod in self.modifiers)
-        
-        # For keybinds with a trigger key
-        # Check if all required modifiers are pressed
-        if not all(mod in pressed_keys for mod in self.modifiers):
-            return False
-        
-        # Check if the trigger key matches
-        if self.key and current_key == self.key:
-            return True
-        if self.char and hasattr(current_key, 'char') and current_key.char == self.char:
-            return True
-            
-        return False
-    
-    def is_still_held(self, pressed_keys: Set) -> bool:
-        """Check if the keybind is still being held."""
-        # For modifier-only keybinds, all modifiers must still be pressed
-        if not self.key and not self.char:
-            return all(mod in pressed_keys for mod in self.modifiers)
-        
-        # For keybinds with trigger keys, all modifiers must still be pressed
-        return all(mod in pressed_keys for mod in self.modifiers)
 
 
 class PTTKeybindManager:
     """
     Push-to-Talk keybind manager that triggers on press and release.
+    Uses a cleaner implementation based on the provided example.
     """
     
     def __init__(self):
@@ -67,17 +33,16 @@ class PTTKeybindManager:
         self.on_press_callback: Optional[Callable] = None
         self.on_release_callback: Optional[Callable] = None
         
-        self.pressed_keys: Set = set()
-        self.ptt_state = PTTState.IDLE
         self.listener: Optional[keyboard.Listener] = None
-        self._lock = threading.Lock()
+        self.ptt_state = PTTState.IDLE
         
-        # Track the specific key combination that triggered PTT
-        self.active_trigger_keys: Set = set()
+        # Track shift keys using simple string identifiers
+        self.pressed_shifts: Set[str] = set()
+        self.has_triggered_for_current_combo = False
         
-        # Track shift keys specifically for better handling
-        self.left_shift_pressed = False
-        self.right_shift_pressed = False
+        # Constants for clarity
+        self.LEFT = "left"
+        self.RIGHT = "right"
         
         # Auto-recovery monitoring
         self._monitor_thread: Optional[threading.Thread] = None
@@ -136,80 +101,65 @@ class PTTKeybindManager:
     
     def reset_state(self):
         """Reset the internal state."""
-        with self._lock:
-            self.pressed_keys.clear()
-            self.active_trigger_keys.clear()
-            self.ptt_state = PTTState.IDLE
-            self.left_shift_pressed = False
-            self.right_shift_pressed = False
+        self.pressed_shifts.clear()
+        self.has_triggered_for_current_combo = False
+        self.ptt_state = PTTState.IDLE
+    
+    def _is_left_shift(self, key) -> bool:
+        """Check if key is left shift."""
+        left_shift_key = getattr(keyboard.Key, "shift_l", None)
+        return left_shift_key is not None and key == left_shift_key
+    
+    def _is_right_shift(self, key) -> bool:
+        """Check if key is right shift."""
+        right_shift_key = getattr(keyboard.Key, "shift_r", None)
+        return right_shift_key is not None and key == right_shift_key
     
     def _on_press(self, key):
-        """Handle key press events."""
+        """Handle key press events - clean implementation."""
         self._last_event_time = time.time()
         
-        with self._lock:
-            # Track shift keys specifically
-            if key in (keyboard.Key.shift_l, keyboard.Key.shift):
-                self.left_shift_pressed = True
-            elif key == keyboard.Key.shift_r:
-                self.right_shift_pressed = True
+        # Ignore generic Key.shift on press; require side-specific keys
+        if self._is_left_shift(key):
+            self.pressed_shifts.add(self.LEFT)
+        elif self._is_right_shift(key):
+            self.pressed_shifts.add(self.RIGHT)
+        
+        # Check if both shifts are pressed and we haven't triggered yet
+        if (self.LEFT in self.pressed_shifts and 
+            self.RIGHT in self.pressed_shifts and 
+            not self.has_triggered_for_current_combo):
             
-            # Add key to pressed set
-            self.pressed_keys.add(key)
-            
-            # Only trigger if not already pressed
-            if self.ptt_state == PTTState.IDLE:
-                # Special handling for left+right shift combination
-                if (self.ptt_keybind and 
-                    keyboard.Key.shift_l in self.ptt_keybind.modifiers and 
-                    keyboard.Key.shift_r in self.ptt_keybind.modifiers):
-                    # Check if both shifts are pressed
-                    if self.left_shift_pressed and self.right_shift_pressed:
-                        self.active_trigger_keys = {keyboard.Key.shift_l, keyboard.Key.shift_r}
-                        self._trigger_press()
-                elif self.ptt_keybind and self.ptt_keybind.matches(self.pressed_keys, key):
-                    # Record which keys triggered the PTT
-                    self.active_trigger_keys = self.pressed_keys.copy()
-                    self._trigger_press()
+            self.has_triggered_for_current_combo = True
+            self._trigger_press()
     
     def _on_release(self, key):
-        """Handle key release events."""
+        """Handle key release events - clean implementation."""
         self._last_event_time = time.time()
         
-        with self._lock:
-            # Track shift key releases
-            shift_released = False
-            if key in (keyboard.Key.shift_l, keyboard.Key.shift):
-                self.left_shift_pressed = False
-                shift_released = True
-            elif key == keyboard.Key.shift_r:
-                self.right_shift_pressed = False
-                shift_released = True
+        released_any = False
+        
+        # If we get a generic Shift release, clear both to avoid stuck state
+        if key == keyboard.Key.shift:
+            if self.pressed_shifts:
+                self.pressed_shifts.clear()
+                released_any = True
+        elif self._is_left_shift(key):
+            if self.LEFT in self.pressed_shifts:
+                self.pressed_shifts.discard(self.LEFT)
+                released_any = True
+        elif self._is_right_shift(key):
+            if self.RIGHT in self.pressed_shifts:
+                self.pressed_shifts.discard(self.RIGHT)
+                released_any = True
+        
+        if released_any:
+            # Allow triggering again on the next time both are held
+            self.has_triggered_for_current_combo = False
             
-            # Remove key from pressed set
-            self.pressed_keys.discard(key)
-            # Also remove generic shift if a specific shift is released
-            if key in (keyboard.Key.shift_l, keyboard.Key.shift_r):
-                self.pressed_keys.discard(keyboard.Key.shift)
-            # Also remove specific shifts if generic shift is released
-            elif key == keyboard.Key.shift:
-                self.pressed_keys.discard(keyboard.Key.shift_l)
-                self.pressed_keys.discard(keyboard.Key.shift_r)
-            
-            # Check if PTT should be released
+            # If we were in pressed state, trigger release
             if self.ptt_state == PTTState.PRESSED:
-                # Special handling for left+right shift combination
-                if (self.ptt_keybind and 
-                    keyboard.Key.shift_l in self.ptt_keybind.modifiers and 
-                    keyboard.Key.shift_r in self.ptt_keybind.modifiers):
-                    # Release if either shift is released
-                    if shift_released and (not self.left_shift_pressed or not self.right_shift_pressed):
-                        self._trigger_release()
-                # For other keybinds, use standard logic
-                elif key in self.active_trigger_keys:
-                    self._trigger_release()
-                elif not self.ptt_keybind.is_still_held(self.pressed_keys):
-                    self._trigger_release()
+                self._trigger_release()
     
     def _trigger_press(self):
         """Trigger PTT press callback."""
@@ -234,7 +184,6 @@ class PTTKeybindManager:
             return
             
         self.ptt_state = PTTState.RELEASED
-        self.active_trigger_keys.clear()
         
         if self.on_release_callback:
             # Run callback in separate thread to avoid blocking
@@ -245,8 +194,7 @@ class PTTKeybindManager:
                     print(f"Error in PTT release callback: {e}")
                 finally:
                     # Reset to idle after release is processed
-                    with self._lock:
-                        self.ptt_state = PTTState.IDLE
+                    self.ptt_state = PTTState.IDLE
             
             threading.Thread(target=run_callback, daemon=True).start()
         else:

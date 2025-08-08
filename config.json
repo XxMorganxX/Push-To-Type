@@ -12,6 +12,9 @@
     "toggle_transcription": "cmd+shift+t",
     "clear_buffer": "cmd+shift+c"
   },
+  "listeners": {
+    "use_quartz_listener": true
+  },
   "word_joiners": ["/", "-", ":", "@", "#"],
   "phrase_replacements": {
     "forward slash": "/",

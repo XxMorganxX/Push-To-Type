@@ -21,6 +21,7 @@ import websocket
 
 from core.ptt_keybind_manager import PTTKeybind, PTTKeybindManager
 from core.event_tap_listener import EventTapPTTListener
+from Quartz import CGEventSourceKeyState, kCGEventSourceStateCombinedSessionState
 from core.unicode_injector import UnicodeInjector
 from pynput import keyboard
 
@@ -529,16 +530,34 @@ class PushToTalkApp:
         self.kbm: Optional[PTTKeybindManager] = None
         self.quartz_listener: Optional[EventTapPTTListener] = None
         self.keyboard_listener: Optional[keyboard.Listener] = None  # legacy; no longer used
-        self.ptt_keybind = PTTKeybind(
-            modifiers={keyboard.Key.shift_l, keyboard.Key.shift_r}
-        )
+        
+        # Create PTT keybind from config
+        ptt_config = self.config.get("keybinds", {}).get("ptt", "leftshift+rightshift")
+        if ptt_config == "leftshift+rightshift":
+            self.ptt_keybind = PTTKeybind(
+                modifiers={keyboard.Key.shift_l, keyboard.Key.shift_r}
+            )
+        else:
+            # Try to parse from config string  
+            if hasattr(PTTKeybindManager(), 'create_keybind_from_string'):
+                temp_manager = PTTKeybindManager()
+                parsed_keybind = temp_manager.create_keybind_from_string(ptt_config)
+                self.ptt_keybind = parsed_keybind if parsed_keybind else PTTKeybind(
+                    modifiers={keyboard.Key.shift_l, keyboard.Key.shift_r}
+                )
+            else:
+                # Fallback to default
+                self.ptt_keybind = PTTKeybind(
+                    modifiers={keyboard.Key.shift_l, keyboard.Key.shift_r}
+                )
         self.ptt_active = False
         self.ptt_pressed_at: Optional[float] = None
         # Listener watchdog to ensure long-running reliability
         self.listener_watchdog_thread: Optional[threading.Thread] = None
         self.listener_watchdog_stop = threading.Event()
         self.listener_restart_lock = threading.Lock()
-        print(f"Debug: Created keybind with modifiers: {self.ptt_keybind.modifiers}")
+        print(f"🔧 PTT Keybind configured: {ptt_config}")
+        print(f"🔧 Parsed modifiers: {self.ptt_keybind.modifiers}")
         
     def _load_config(self, config_path: str) -> dict:
         """Load configuration from JSON file."""
@@ -563,11 +582,13 @@ class PushToTalkApp:
             print("🔁 PTTKeybindManager started")
         except Exception as e:
             print(f"❌ Failed to start PTTKeybindManager: {e}")
-        # Start Quartz event tap listener as a redundancy if desired
+        # Start Quartz event tap listener (always require both left + right shift)
         try:
-            self.quartz_listener = EventTapPTTListener(self._on_ptt_press, self._on_ptt_release, require_left_right_shift=True)
+            self.quartz_listener = EventTapPTTListener(
+                self._on_ptt_press, self._on_ptt_release, require_left_right_shift=True
+            )
             self.quartz_listener.start()
-            print("🧲 Quartz event tap listener started")
+            print("🧲 Quartz event tap listener started (requires L+R Shift)")
         except Exception as e:
             print(f"⚠️ Failed to start Quartz event tap listener: {e}")
         # Start watchdog
@@ -593,7 +614,7 @@ class PushToTalkApp:
 
     def _watch_keyboard_listener(self):
         """Watchdog that restarts the keyboard listener if it dies and handles stuck PTT."""
-        stuck_threshold_s = 10.0
+        stuck_threshold_s = 90.0
         check_interval = 3.0  # Check more frequently
         last_quartz_restart = 0
         
@@ -668,50 +689,37 @@ class PushToTalkApp:
             except Exception as e:
                 print(f"⚠️ Keyboard listener watchdog error: {e}")
     
-    def _on_key_press(self, key):
-        """Handle key press events directly."""
-        self.pressed_keys.add(key)
-        
-        # Use the exact same matching logic as debug script
-        matches = self.ptt_keybind.matches(self.pressed_keys, key)
-        
-        if matches and not self.ptt_active:
-            self.ptt_active = True
-            self._on_ptt_press()
-    
-    def _on_key_release(self, key):
-        """Handle key release events directly."""
-        self.pressed_keys.discard(key)
-        
-        # Check if keybind is no longer held
-        if self.ptt_active:
-            still_held = self.ptt_keybind.is_still_held(self.pressed_keys)
-            if not still_held:
-                self.ptt_active = False
-                self._on_ptt_release()
     
     def _on_ptt_press(self):
         """Handle PTT key press (start transcription)."""
+        if self.ptt_active:
+            return
+        
         print("\n" + "="*60)
-        print(f"🎤 PTT PRESSED at {time.time():.3f} - Recording...")
+        print("🎤 PTT PRESSED - Recording...")
         print("💡 Text will appear at your cursor position!")
         print("="*60)
         
         self.ptt_pressed_at = time.time()
+        self.ptt_active = True
+        
         if not self.is_transcribing:
             self._start_transcription()
-            # Indicator removed
     
     def _on_ptt_release(self):
         """Handle PTT key release (stop transcription)."""
+        if not self.ptt_active:
+            return
+            
         print("\n" + "="*60)
         print("🔴 PTT RELEASED - Stopping...")
         print("="*60)
         
         self.ptt_pressed_at = None
+        self.ptt_active = False
+        
         if self.is_transcribing:
             self._stop_transcription()
-            # Indicator removed
     
     def _start_transcription(self):
         """Start the transcription session."""
