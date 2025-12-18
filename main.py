@@ -5,6 +5,7 @@ Fixed version using AssemblyAI's official sample code approach
 """
 
 import json
+import signal
 import pyaudio
 import threading
 import sys
@@ -21,8 +22,9 @@ import websocket
 
 from core.ptt_keybind_manager import PTTKeybind, PTTKeybindManager
 from core.event_tap_listener import EventTapPTTListener
-from Quartz import CGEventSourceKeyState, kCGEventSourceStateCombinedSessionState
+# Note: previously imported CGEventSourceKeyState and kCGEventSourceStateCombinedSessionState are unused; removed
 from core.unicode_injector import UnicodeInjector
+from core.ptt_indicator import PTTIndicator, create_indicator
 from pynput import keyboard
 
 load_dotenv()
@@ -66,20 +68,60 @@ class PTTTranscriber:
     WebSocket transcriber with keyboard injection output.
     """
     
-    def __init__(self, config: AssemblyAIConfig, word_replacements: Optional[Dict[str, str]] = None, joiner_values: Optional[List[str]] = None, phrase_replacements: Optional[Dict[str, str]] = None):
+    def __init__(
+        self,
+        config: AssemblyAIConfig,
+        word_replacements: Optional[Dict[str, str]] = None,
+        joiner_values: Optional[List[str]] = None,
+        phrase_replacements: Optional[Dict[str, str]] = None,
+        audio_chunk_duration_ms: Optional[int] = None,
+        min_send_ms: Optional[int] = None,
+        prebuffer_ms: Optional[int] = None,
+        typing_mode: Optional[str] = None,
+        preserve_clipboard: Optional[bool] = None,
+    ):
         """Initialize the transcriber."""
         self.config = config
         self.state = TranscriptionState.IDLE
         
-        # Audio configuration
-        self.chunk_duration_ms = 20  # 20 ms chunks for snappier streaming
+        # Audio configuration (configurable)
+        # Clamp chunk duration to sensible real-time ranges (5–50ms)
+        if audio_chunk_duration_ms is None:
+            self.chunk_duration_ms = 20
+        else:
+            try:
+                self.chunk_duration_ms = max(5, min(50, int(audio_chunk_duration_ms)))
+            except Exception:
+                self.chunk_duration_ms = 20
         self.chunk_size = int(self.config.sample_rate * self.chunk_duration_ms / 1000)
-        self.min_send_duration_ms = 50  # API requires 50–1000 ms per message
+        # API requires 50–1000 ms per message; clamp accordingly
+        if min_send_ms is None:
+            self.min_send_duration_ms = 50
+        else:
+            try:
+                self.min_send_duration_ms = max(50, min(1000, int(min_send_ms)))
+            except Exception:
+                self.min_send_duration_ms = 50
         self.audio_format = pyaudio.paInt16
         self.channels = 1
+        # Prebuffer for initial audio while WS connects
+        try:
+            self.prebuffer_ms = 250 if prebuffer_ms is None else max(0, min(1000, int(prebuffer_ms)))
+        except Exception:
+            self.prebuffer_ms = 250
+        self.prebuffer = bytearray()
+        self._prebuffer_lock = threading.Lock()
         
-        # Components  
-        self.injector = UnicodeInjector(typing_delay=0.015)  # Slower typing to prevent interference
+        # Components
+        # Default to paste mode to avoid long queues of per-character HID events (which can flush on Ctrl+C)
+        mode = (typing_mode or "paste").strip().lower()
+        if mode not in ("keystroke", "paste"):
+            mode = "paste"
+        self.injector = UnicodeInjector(
+            typing_delay=0.015,
+            mode=mode,  # type: ignore[arg-type]
+            preserve_clipboard=True if preserve_clipboard is None else bool(preserve_clipboard),
+        )
         # Word replacement mapping (token -> replacement string)
         self.word_replacements: Dict[str, str] = {}
         if word_replacements:
@@ -121,13 +163,19 @@ class PTTTranscriber:
         self.committed_word_count = 0  # Count of finalized words emitted in current turn
         self.current_turn_order: Optional[int] = None
         self.last_output_chunk: str = ""
+        # Suppress output flag to prevent injection during shutdown/stop
+        self._suppress_output = False
+        # Track last WebSocket message timestamp for quiet-period waits
+        self._last_ws_msg_time = time.time()
         
     def _on_ws_open(self, ws):
         """Called when WebSocket connection is established."""
         print("✅ WebSocket connection opened")
         self.state = TranscriptionState.LISTENING
         self.ws_ready.set()  # Signal that WebSocket is ready
-        self._start_audio_streaming()
+        # Ensure audio thread is running
+        if (not self.audio_thread) or (not self.audio_thread.is_alive()):
+            self._start_audio_streaming()
 
     def _dedupe_adjacent_words(self, words: List[str]) -> List[str]:
         """Collapse adjacent duplicate words in a list while preserving order.
@@ -181,6 +229,7 @@ class PTTTranscriber:
     def _on_ws_message(self, ws, message):
         """Handle incoming WebSocket messages."""
         try:
+            self._last_ws_msg_time = time.time()
             data = json.loads(message)
             msg_type = data.get('type')
             # Debug: Show ALL received messages
@@ -198,7 +247,7 @@ class PTTTranscriber:
                     self.committed_word_count = 0
                 # Process only unformatted words to avoid duplicate final outputs
                 words = data.get('words') or []
-                if words and not is_formatted:
+                if words and not is_formatted and not self._suppress_output:
                     with self.typing_lock:
                         new_tokens: List[str] = []
                         max_final_index = self.committed_word_count
@@ -240,13 +289,13 @@ class PTTTranscriber:
                                 if to_type == self.last_output_chunk or (to_type and self.session_text.endswith(to_type)):
                                     print("\n⏭️  Skipping duplicate chunk")
                                 else:
-                                    print("\n⌨️  WORDS: '%s'" % to_type)
+                                    #print("\n⌨️  WORDS: '%s'" % to_type)
                                     self.injector.inject_text(to_type)
                                     self.session_text += to_type
                                     self.total_characters_typed += len(to_type)
                                     self.last_output_chunk = to_type
                 # Only close out the turn for unformatted final message
-                if is_final and not is_formatted:
+                if is_final and not is_formatted and not self._suppress_output:
                     if self.session_text and not self.session_text.endswith(' '):
                         self.injector.inject_text(' ')
                         self.session_text += ' '
@@ -300,53 +349,68 @@ class PTTTranscriber:
             min_send_frames = int(self.config.sample_rate * self.min_send_duration_ms / 1000)
             min_send_bytes = min_send_frames * bytes_per_frame
             send_count = 0
+            # Prebuffer capacity in bytes
+            prebuffer_max_bytes = 0
+            try:
+                if getattr(self, 'prebuffer_ms', 0) > 0:
+                    prebuffer_frames = int(self.config.sample_rate * self.prebuffer_ms / 1000)
+                    prebuffer_max_bytes = max(0, prebuffer_frames * bytes_per_frame)
+            except Exception:
+                prebuffer_max_bytes = 0
 
             while not self.stop_event.is_set():
                 try:
                     # Check if audio stream is valid and not cleaned up
                     with self._audio_cleanup_lock:
-                        stream_valid = (self.audio_stream and 
-                                      not self._audio_cleaned_up and
-                                      self.ws_app and 
-                                      hasattr(self.ws_app, 'sock') and 
-                                      self.ws_app.sock and 
-                                      self.ws_ready.is_set())
-                    
-                    if stream_valid:
-                        try:
-                            audio_data = self.audio_stream.read(
-                                self.chunk_size, 
-                                exception_on_overflow=False
-                            )
-                            send_buffer.extend(audio_data)
+                        stream_valid = (self.audio_stream and not self._audio_cleaned_up)
 
-                            # Send in >= 50 ms chunks to satisfy API requirement
-                            while len(send_buffer) >= min_send_bytes:
-                                to_send = bytes(send_buffer[:min_send_bytes])
-                                del send_buffer[:min_send_bytes]
-                                
-                                # Check WebSocket is still valid before sending
-                                if (self.ws_app and hasattr(self.ws_app, 'sock') and 
-                                    self.ws_app.sock):
-                                    self.ws_app.send(to_send, websocket.ABNF.OPCODE_BINARY)
-                                    send_count += 1
-
-                                    # Print a status dot roughly every 500 ms of audio sent
-                                    dots_every = max(1, int(500 / self.min_send_duration_ms))
-                                    if send_count % dots_every == 0:
-                                        print(".", end="", flush=True)
-                                else:
-                                    break  # WebSocket closed, exit sending loop
-                        except Exception as stream_e:
-                            # Handle specific audio stream errors
-                            if not self.stop_event.is_set():
-                                print(f"\n❌ Audio stream error: {stream_e}")
-                            break
-                    else:
-                        # Stream not valid, but check if we should continue waiting
+                    if not stream_valid:
                         if not self.stop_event.is_set():
-                            time.sleep(0.01)  # Small delay to prevent tight loop
-                        
+                            time.sleep(0.01)
+                        continue
+
+                    # Always read audio to avoid losing initial speech
+                    try:
+                        audio_data = self.audio_stream.read(
+                            self.chunk_size,
+                            exception_on_overflow=False
+                        )
+                    except Exception as stream_e:
+                        if not self.stop_event.is_set():
+                            print(f"\n❌ Audio stream error: {stream_e}")
+                        break
+
+                    # If WS not ready, accumulate prebuffer and continue
+                    if not (self.ws_app and hasattr(self.ws_app, 'sock') and self.ws_app.sock and self.ws_ready.is_set()):
+                        if prebuffer_max_bytes > 0:
+                            with self._prebuffer_lock:
+                                self.prebuffer.extend(audio_data)
+                                if len(self.prebuffer) > prebuffer_max_bytes:
+                                    self.prebuffer = self.prebuffer[-prebuffer_max_bytes:]
+                        continue
+
+                    # Drain prebuffer first
+                    if self.prebuffer:
+                        with self._prebuffer_lock:
+                            if self.prebuffer:
+                                send_buffer.extend(self.prebuffer)
+                                self.prebuffer = bytearray()
+
+                    # Append latest audio
+                    send_buffer.extend(audio_data)
+
+                    # Send in >= min_send_bytes chunks
+                    while len(send_buffer) >= min_send_bytes:
+                        to_send = bytes(send_buffer[:min_send_bytes])
+                        del send_buffer[:min_send_bytes]
+                        if (self.ws_app and hasattr(self.ws_app, 'sock') and self.ws_app.sock):
+                            self.ws_app.send(to_send, websocket.ABNF.OPCODE_BINARY)
+                            send_count += 1
+                            dots_every = max(1, int(500 / self.min_send_duration_ms))
+                            if send_count % dots_every == 0:
+                                print(".", end="", flush=True)
+                        else:
+                            break
                 except Exception as e:
                     if not self.stop_event.is_set():
                         print(f"\n❌ Error in audio streaming loop: {e}")
@@ -376,6 +440,15 @@ class PTTTranscriber:
         try:
             self.state = TranscriptionState.CONNECTING
             print("🔄 Starting transcription session...")
+            # Allow output again for new session and reset quiet timer
+            self._suppress_output = False
+            self._last_ws_msg_time = time.time()
+            # Ensure injector is enabled for new session
+            try:
+                if hasattr(self.injector, "enable"):
+                    self.injector.enable()
+            except Exception:
+                pass
             
             # Reset audio cleanup flag for new session
             with self._audio_cleanup_lock:
@@ -391,6 +464,9 @@ class PTTTranscriber:
                 rate=self.config.sample_rate,
             )
             print("✅ Microphone opened successfully")
+            # Start audio capture immediately (fills prebuffer while WS connects)
+            if (not self.audio_thread) or (not self.audio_thread.is_alive()):
+                self._start_audio_streaming()
             
             # Create WebSocketApp
             self.ws_app = websocket.WebSocketApp(
@@ -413,10 +489,25 @@ class PTTTranscriber:
             print(f"❌ Failed to start transcription: {e}")
             self.state = TranscriptionState.ERROR
     
-    def stop_transcription(self):
+    def stop_transcription(self, suppress_output: bool = False, final_quiet_ms: int = 600, max_wait_ms: int = 1800):
         """Stop the transcription session."""
         print("\n🛑 Stopping audio streaming...")
-        
+
+        # On shutdown, suppress output FIRST to prevent any last-millisecond injections
+        # from WS messages arriving concurrently with teardown.
+        self._suppress_output = bool(suppress_output)
+        if suppress_output:
+            try:
+                # Hard-stop typing and clear any queued work immediately
+                if hasattr(self.injector, "flush_and_clear"):
+                    self.injector.flush_and_clear()
+                elif hasattr(self.injector, "disable"):
+                    self.injector.disable()
+                else:
+                    self.injector.stop()
+            except Exception:
+                pass
+
         # Signal stop audio streaming but keep WebSocket open momentarily
         self.stop_event.set()
         
@@ -427,9 +518,16 @@ class PTTTranscriber:
         # Cleanup audio first
         self._cleanup_audio()
         
-        # Wait a moment for any final transcription messages
-        print("⏱️  Waiting for final transcription...")
-        time.sleep(1.0)
+        # On normal release, wait for a short quiet period to capture final words
+        if not suppress_output:
+            print("⏱️  Waiting for final transcription (quiet period)...")
+            start_wait = time.time()
+            max_wait_s = max_wait_ms / 1000.0
+            quiet_s = final_quiet_ms / 1000.0
+            while (time.time() - start_wait) < max_wait_s:
+                if (time.time() - self._last_ws_msg_time) >= quiet_s:
+                    break
+                time.sleep(0.05)
         
         # Now send termination and close WebSocket
         if (self.ws_app and 
@@ -456,7 +554,11 @@ class PTTTranscriber:
             self.ws_thread.join(timeout=1.0)
         
         # Stop typing
-        self.injector.stop()
+        try:
+            # Stop worker and drop any stale queue
+            self.injector.stop()
+        except Exception:
+            pass
         
         # Show session summary
         if hasattr(self, 'total_characters_typed') and self.total_characters_typed > 0:
@@ -475,6 +577,27 @@ class PTTTranscriber:
         
         self.state = TranscriptionState.IDLE
         print("✅ Transcription stopped")
+
+    def quiesce_output(self):
+        """Prevent any further keystroke injection immediately."""
+        self._suppress_output = True
+        try:
+            # Emergency flush to prevent spurious output on shutdown
+            if hasattr(self.injector, "flush_and_clear"):
+                self.injector.flush_and_clear()
+            # Disable accepts and invalidate any in-flight or queued items
+            elif hasattr(self.injector, "disable"):
+                self.injector.disable()
+            else:
+                self.injector.stop()
+            # Ensure no in-flight injection remains
+            try:
+                if hasattr(self.injector, "wait_idle"):
+                    self.injector.wait_idle(timeout=1.0)
+            except Exception:
+                pass
+        except Exception:
+            pass
     
     def _cleanup_audio(self):
         """Clean up audio resources - thread-safe and idempotent."""
@@ -556,6 +679,17 @@ class PushToTalkApp:
         self.listener_watchdog_thread: Optional[threading.Thread] = None
         self.listener_watchdog_stop = threading.Event()
         self.listener_restart_lock = threading.Lock()
+        self.shutting_down = threading.Event()
+        self.cleanup_started = threading.Event()
+        
+        # PTT indicator (visual feedback)
+        indicator_config = self.config.get("indicator", {})
+        if indicator_config.get("enabled", True):
+            self.indicator: Optional[PTTIndicator] = create_indicator(indicator_config)
+            print("🔴 PTT indicator enabled")
+        else:
+            self.indicator = None
+        
         print(f"🔧 PTT Keybind configured: {ptt_config}")
         print(f"🔧 Parsed modifiers: {self.ptt_keybind.modifiers}")
         
@@ -692,7 +826,7 @@ class PushToTalkApp:
     
     def _on_ptt_press(self):
         """Handle PTT key press (start transcription)."""
-        if self.ptt_active:
+        if self.shutting_down.is_set() or self.ptt_active:
             return
         
         print("\n" + "="*60)
@@ -703,12 +837,19 @@ class PushToTalkApp:
         self.ptt_pressed_at = time.time()
         self.ptt_active = True
         
+        # Show indicator
+        if self.indicator:
+            try:
+                self.indicator.show_active()
+            except Exception:
+                pass
+        
         if not self.is_transcribing:
             self._start_transcription()
     
     def _on_ptt_release(self):
         """Handle PTT key release (stop transcription)."""
-        if not self.ptt_active:
+        if self.shutting_down.is_set() or not self.ptt_active:
             return
             
         print("\n" + "="*60)
@@ -718,8 +859,16 @@ class PushToTalkApp:
         self.ptt_pressed_at = None
         self.ptt_active = False
         
+        # Hide indicator
+        if self.indicator:
+            try:
+                self.indicator.show_idle()
+            except Exception:
+                pass
+        
         if self.is_transcribing:
-            self._stop_transcription()
+            # Normal PTT release: don't suppress output; allow quiet-period
+            self._stop_transcription(suppress_output=False)
     
     def _start_transcription(self):
         """Start the transcription session."""
@@ -776,11 +925,22 @@ class PushToTalkApp:
                 "dash": "-",
                 "hyphen": "-"
             })
+            # Audio tuning from config
+            audio_cfg = cfg.get("audio", {}) if isinstance(cfg, dict) else {}
+            chunk_duration_ms_cfg = audio_cfg.get("chunk_duration_ms")
+            min_send_ms_cfg = audio_cfg.get("min_send_ms")
+            prebuffer_ms_cfg = audio_cfg.get("prebuffer_ms")
+
             self.transcriber = PTTTranscriber(
                 ai_config,
                 word_replacements=word_replacements,
                 joiner_values=joiner_values,
                 phrase_replacements=phrase_replacements,
+                audio_chunk_duration_ms=chunk_duration_ms_cfg,
+                min_send_ms=min_send_ms_cfg,
+                prebuffer_ms=prebuffer_ms_cfg,
+                typing_mode=(self.config.get("typing", {}) or {}).get("mode"),
+                preserve_clipboard=(self.config.get("typing", {}) or {}).get("preserve_clipboard"),
             )
             
             # Adjust typing delay if configured
@@ -788,6 +948,13 @@ class PushToTalkApp:
                 self.transcriber.injector.typing_delay = self.config["typing"].get(
                     "delay_ms", 5
                 ) / 1000
+                # Optional: allow switching injection mode
+                try:
+                    mode = self.config["typing"].get("mode")
+                    if mode:
+                        self.transcriber.injector.mode = str(mode).strip().lower()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
             
             # Start transcription
             self.transcriber.start_transcription()
@@ -798,14 +965,22 @@ class PushToTalkApp:
             traceback.print_exc()
             self.is_transcribing = False
     
-    def _stop_transcription(self):
+    def _stop_transcription(self, suppress_output: bool = False, final_quiet_ms: Optional[int] = None, max_wait_ms: Optional[int] = None):
         """Stop the transcription session."""
         if not self.is_transcribing or not self.transcriber:
             return
         
         # Stop the transcriber
         if self.transcriber:
-            self.transcriber.stop_transcription()
+            # Pull quiet-period settings from config if not explicitly provided
+            cfg_session = self.config.get("session", {}) if isinstance(self.config, dict) else {}
+            fq = final_quiet_ms if final_quiet_ms is not None else cfg_session.get("final_quiet_ms", 800)
+            mw = max_wait_ms if max_wait_ms is not None else cfg_session.get("max_final_wait_ms", 2500)
+            self.transcriber.stop_transcription(
+                suppress_output=suppress_output,
+                final_quiet_ms=int(fq),
+                max_wait_ms=int(mw),
+            )
         
         # Clean up
         self.transcriber = None
@@ -815,25 +990,32 @@ class PushToTalkApp:
     
     def cleanup(self):
         """Cleanup all resources."""
+        if self.cleanup_started.is_set():
+            return
+        self.cleanup_started.set()
         print("\n🔄 Cleaning up...")
+        # Block any further PTT callbacks
+        self.shutting_down.set()
+        # Emergency flush any queued typing to prevent spurious output
+        try:
+            if self.transcriber and hasattr(self.transcriber, 'injector'):
+                self.transcriber.injector.flush_and_clear()
+        except Exception:
+            pass
+        
+        # Quiesce any output immediately
+        try:
+            if self.transcriber:
+                self.transcriber.quiesce_output()
+        except Exception:
+            pass
         
         # Stop transcription if active
         if self.is_transcribing:
-            self._stop_transcription()
+            # Suppress output during full app shutdown
+            self._stop_transcription(suppress_output=True)
         
-        # Stop keybind manager and watchdog
-        try:
-            if self.kbm:
-                print("⌨️  Stopping keybind manager...")
-                self.kbm.stop()
-        except Exception:
-            pass
-        try:
-            if self.quartz_listener:
-                print("🧲 Stopping Quartz event tap listener...")
-                self.quartz_listener.stop()
-        except Exception:
-            pass
+        # First stop watchdog to avoid restarts during shutdown
         self.listener_watchdog_stop.set()
         if self.listener_watchdog_thread and self.listener_watchdog_thread.is_alive():
             try:
@@ -841,10 +1023,30 @@ class PushToTalkApp:
             except Exception:
                 pass
         
+        # Then stop listeners cleanly
+        try:
+            if self.quartz_listener:
+                print("🧲 Stopping Quartz event tap listener...")
+                self.quartz_listener.stop()
+        except Exception:
+            pass
+        try:
+            if self.kbm:
+                print("⌨️  Stopping keybind manager...")
+                self.kbm.stop()
+        except Exception:
+            pass
+        
         # Cleanup transcriber
         if self.transcriber:
             self.transcriber.cleanup()
-        # Indicator removed
+        
+        # Cleanup indicator
+        if self.indicator:
+            try:
+                self.indicator.cleanup()
+            except Exception:
+                pass
         
         print("✅ Cleanup complete")
     
@@ -882,10 +1084,23 @@ class PushToTalkApp:
         
         # Setup PTT
         self._setup_ptt()
+
+        # Initialize indicator on main thread (Cocoa requirement)
+        if self.indicator:
+            try:
+                self.indicator.initialize()
+            except Exception as e:
+                print(f"⚠️ Failed to initialize indicator: {e}")
         
         # Keep running until interrupted
         try:
             while True:
+                # Pump indicator run loop so the overlay can render/update
+                if self.indicator:
+                    try:
+                        self.indicator.pump(max_step_s=0.01)
+                    except Exception:
+                        pass
                 time.sleep(0.1)
         except KeyboardInterrupt:
             print("\n\n⚠️ Interrupt received...")
@@ -910,6 +1125,50 @@ def main():
     
     # Create application
     app = PushToTalkApp(config_path=args.config)
+
+    # Install signal handlers to quiesce output immediately on interrupt/terminate
+    def _handle_signal(signum, _frame):
+        try:
+            print(f"\n⚠️  Signal {signum} received - shutting down...")
+        except Exception:
+            pass
+        try:
+            app.shutting_down.set()
+        except Exception:
+            pass
+        try:
+            if getattr(app, 'transcriber', None):
+                if hasattr(app.transcriber, 'injector'):
+                    app.transcriber.injector.flush_and_clear()
+                app.transcriber.quiesce_output()
+        except Exception:
+            pass
+        try:
+            app.cleanup()
+            # Give the OS a moment to drain any already-posted HID events; without this
+            # you can see a "burst" of queued characters after Ctrl+C.
+            try:
+                time.sleep(0.25)
+            except Exception:
+                pass
+        finally:
+            try:
+                sys.exit(128 + signum)
+            except SystemExit:
+                raise
+
+    try:
+        signal.signal(signal.SIGINT, _handle_signal)
+    except Exception:
+        pass
+    try:
+        signal.signal(signal.SIGTERM, _handle_signal)
+    except Exception:
+        pass
+    try:
+        signal.signal(signal.SIGQUIT, _handle_signal)
+    except Exception:
+        pass
     
     # Run application
     try:

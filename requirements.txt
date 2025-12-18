@@ -1,26 +1,8 @@
-# Core WebSocket and async support
+# Core dependencies for PTT Transcription
 websockets>=11.0
-asyncio-mqtt>=0.16.1
-
-# Environment variables
 python-dotenv>=1.0.0
-
-# Audio processing
 pyaudio>=0.2.11
-
-# Keyboard input handling
 pynput>=1.7.6
-
-# macOS-specific Unicode injection
 pyobjc-core>=9.0
 pyobjc-framework-Quartz>=9.0
-
-# Optional: For AI enhancement pipeline
-openai>=1.0.0  # If using OpenAI for text enhancement
-anthropic>=0.3.0  # If using Claude for text enhancement
-
-# Development dependencies
-pytest>=7.0.0
-pytest-asyncio>=0.21.0
-black>=23.0.0
-mypy>=1.0.0
+pyobjc-framework-Cocoa>=9.0

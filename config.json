@@ -5,6 +5,14 @@
     "word_boost": [],
     "boost_param": "high"
   },
+  "indicator": {
+    "enabled": true,
+    "size": 16,
+    "position_x": 12,
+    "position_y": 45,
+    "active_color": [1.0, 0.2, 0.2, 0.95],
+    "idle_color": null
+  },
   "keybinds": {
     "ptt": "leftshift+rightshift",
     "start_transcription": "cmd+shift+space",
@@ -29,6 +37,8 @@
   },
   "typing": {
     "delay_ms": 5,
+    "mode": "paste",
+    "preserve_clipboard": true,
     "use_word_boundaries": true,
     "auto_punctuation": false
   },
@@ -36,10 +46,15 @@
     "cooldown_seconds": 0.5,
     "auto_restart_on_error": true,
     "max_retry_attempts": 3,
-    "retry_delay_seconds": 2
+    "retry_delay_seconds": 2,
+    "final_quiet_ms": 800,
+    "max_final_wait_ms": 2000
   },
   "audio": {
     "chunk_size": 3200,
+    "chunk_duration_ms": 10,
+    "min_send_ms": 20,
+    "prebuffer_ms": 100,
     "input_device": null,
     "auto_gain_control": true
   },

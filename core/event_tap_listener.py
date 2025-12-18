@@ -8,9 +8,9 @@ from Quartz import (
     CGEventTapIsEnabled,
     CGEventSourceKeyState,
     CFMachPortCreateRunLoopSource,
+    CFRunLoopSourceInvalidate,
     CFRunLoopAddSource,
     CFRunLoopGetCurrent,
-    CFRunLoopRun,
     CFRunLoopStop,
     kCGAnnotatedSessionEventTap,
     kCGEventKeyDown,
@@ -19,8 +19,6 @@ from Quartz import (
     kCGEventTapOptionListenOnly,
     kCGHeadInsertEventTap,
     kCGSessionEventTap,
-    CGEventGetIntegerValueField,
-    kCGKeyboardEventKeycode,
     kCGEventSourceStateCombinedSessionState,
 )
 
@@ -54,6 +52,7 @@ class EventTapPTTListener:
         self._active = False
         self._monitor_thread: Optional[threading.Thread] = None
         self._last_event_time = time.time()
+        self._loop = None
 
     def _matches_ptt(self) -> bool:
         if self.require_left_right_shift:
@@ -112,7 +111,7 @@ class EventTapPTTListener:
         self._last_event_time = time.time()
 
         def _run():
-            from Quartz import CFRunLoopSourceInvalidate, CFRunLoopRunInMode  # lazy import
+            from Quartz import CFRunLoopRunInMode  # lazy import
             # Create event tap
             self._tap = CGEventTapCreate(
                 kCGSessionEventTap,
@@ -142,6 +141,7 @@ class EventTapPTTListener:
 
             self._runloop_source = CFMachPortCreateRunLoopSource(None, self._tap, 0)
             loop = CFRunLoopGetCurrent()
+            self._loop = loop
             CFRunLoopAddSource(loop, self._runloop_source, 0)
             CGEventTapEnable(self._tap, True)
 
@@ -162,7 +162,7 @@ class EventTapPTTListener:
             # Cleanup
             try:
                 if self._runloop_source is not None:
-                    CFRunLoopSourceInvalidate = CFRunLoopSourceInvalidate  # just to satisfy linters
+                    CFRunLoopSourceInvalidate(self._runloop_source)
             except Exception:
                 pass
 
@@ -207,9 +207,15 @@ class EventTapPTTListener:
                 CGEventTapEnable(self._tap, False)
         except Exception:
             pass
-        # Try to stop runloop
+        # Invalidate runloop source and stop the correct runloop thread
         try:
-            CFRunLoopStop(CFRunLoopGetCurrent())
+            if self._runloop_source is not None:
+                CFRunLoopSourceInvalidate(self._runloop_source)
+        except Exception:
+            pass
+        try:
+            if self._loop is not None:
+                CFRunLoopStop(self._loop)
         except Exception:
             pass
         if self._thread and self._thread.is_alive():
@@ -220,5 +226,6 @@ class EventTapPTTListener:
         self._monitor_thread = None
         self._tap = None
         self._runloop_source = None
+        self._loop = None
 
 
