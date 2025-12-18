@@ -859,10 +859,10 @@ class PushToTalkApp:
         self.ptt_pressed_at = None
         self.ptt_active = False
         
-        # Hide indicator
+        # Show processing indicator (yellow)
         if self.indicator:
             try:
-                self.indicator.show_idle()
+                self.indicator.show_processing()
             except Exception:
                 pass
         
@@ -985,6 +985,13 @@ class PushToTalkApp:
         # Clean up
         self.transcriber = None
         self.is_transcribing = False
+        
+        # Return indicator to ready state (green)
+        if self.indicator:
+            try:
+                self.indicator.show_ready()
+            except Exception:
+                pass
         
         print("✅ Ready for next PTT press")
     

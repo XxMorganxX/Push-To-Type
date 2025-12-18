@@ -57,14 +57,21 @@ class PTTIndicator:
     IMPORTANT: Cocoa UI must be created and pumped on the main thread.
     This class is thread-safe for state changes (press/release callbacks) and
     expects the app to call `pump()` periodically from the main thread.
+    
+    States:
+    - ready: Green - app is running and ready (idle)
+    - active: Red - currently recording (PTT pressed)
+    - processing: Yellow - processing between turns (waiting for final transcription)
     """
     
     def __init__(
         self,
         size: int = 20,
         position: Tuple[int, int] = (20, 20),  # From top-right corner
+        ready_color: Tuple[float, float, float, float] = (0.2, 0.8, 0.2, 0.9),  # Green
         active_color: Tuple[float, float, float, float] = (1.0, 0.3, 0.3, 0.9),  # Red
-        idle_color: Optional[Tuple[float, float, float, float]] = None,  # Hidden when idle
+        processing_color: Tuple[float, float, float, float] = (1.0, 0.8, 0.0, 0.9),  # Yellow
+        idle_color: Optional[Tuple[float, float, float, float]] = None,  # For backwards compat
     ):
         """
         Initialize the PTT indicator.
@@ -72,21 +79,24 @@ class PTTIndicator:
         Args:
             size: Diameter of the indicator dot in pixels
             position: (x, y) offset from top-right corner of screen
-            active_color: RGBA tuple for active state (0.0-1.0)
-            idle_color: RGBA tuple for idle state, or None to hide
+            ready_color: RGBA tuple for ready state (0.0-1.0) - green
+            active_color: RGBA tuple for active/recording state (0.0-1.0) - red
+            processing_color: RGBA tuple for processing state (0.0-1.0) - yellow
+            idle_color: RGBA tuple for idle state, or None (deprecated, use ready_color)
         """
         self.size = size
         self.position = position
+        self.ready_color = ready_color if idle_color is None else idle_color
         self.active_color = active_color
-        self.idle_color = idle_color
+        self.processing_color = processing_color
         
         self._window: Optional[NSWindow] = None
         self._view: Optional[IndicatorView] = None
-        self._is_active = False
+        self._current_state = "ready"  # ready, active, processing
         self._lock = threading.Lock()
         self._initialized = False
         # Desired state set from any thread; applied in `pump()` on main thread
-        self._desired_active: Optional[bool] = None
+        self._desired_state: Optional[str] = "ready"
 
     def initialize(self):
         """
@@ -137,10 +147,8 @@ class PTTIndicator:
                 (1 << 9)    # NSWindowCollectionBehaviorFullScreenAuxiliary
             )
             
-            # Create indicator view with initial color (hidden/clear)
-            initial_color = NSColor.clearColor()
-            if self.idle_color:
-                initial_color = NSColor.colorWithRed_green_blue_alpha_(*self.idle_color)
+            # Create indicator view with initial ready color (green)
+            initial_color = NSColor.colorWithRed_green_blue_alpha_(*self.ready_color)
             
             view_frame = NSMakeRect(0, 0, self.size, self.size)
             self._view = IndicatorView.alloc().initWithFrame_color_(view_frame, initial_color)
@@ -148,9 +156,8 @@ class PTTIndicator:
             
             self._initialized = True
             
-            # Show window if we have an idle color
-            if self.idle_color:
-                self._window.orderFrontRegardless()
+            # Always show window (starts in ready state)
+            self._window.orderFrontRegardless()
                 
         except Exception as e:
             print(f"⚠️ Failed to create indicator window: {e}")
@@ -167,20 +174,29 @@ class PTTIndicator:
         except Exception:
             pass
     
-    def show_active(self):
-        """Show the indicator in active state."""
+    def show_ready(self):
+        """Show the indicator in ready state (green - app running, waiting for PTT)."""
         with self._lock:
-            self._desired_active = True
+            self._desired_state = "ready"
+    
+    def show_active(self):
+        """Show the indicator in active state (red - recording)."""
+        with self._lock:
+            self._desired_state = "active"
+    
+    def show_processing(self):
+        """Show the indicator in processing state (yellow - waiting for final transcription)."""
+        with self._lock:
+            self._desired_state = "processing"
     
     def show_idle(self):
-        """Show the indicator in idle state (or hide if no idle color)."""
-        with self._lock:
-            self._desired_active = False
+        """Alias for show_ready() for backwards compatibility."""
+        self.show_ready()
     
     def hide(self):
-        """Completely hide the indicator."""
+        """Completely hide the indicator (not recommended, use show_ready instead)."""
         with self._lock:
-            self._desired_active = False
+            self._desired_state = None
         # Apply immediately if we're already on main thread and initialized
         if self._window:
             try:
@@ -199,10 +215,10 @@ class PTTIndicator:
 
         # Apply desired state (set by other threads)
         with self._lock:
-            desired = self._desired_active
-            self._desired_active = None
+            desired = self._desired_state
+            # Don't clear _desired_state - keep it so we can check current state
 
-        if desired is not None:
+        if desired is not None and desired != self._current_state:
             self._apply_state(desired)
 
         # Pump the run loop briefly so the window can render/update
@@ -214,23 +230,32 @@ class PTTIndicator:
         except Exception:
             pass
 
-    def _apply_state(self, active: bool):
+    def _apply_state(self, state: str):
+        """Apply a state change to the indicator."""
         if not (self._window and self._view):
             return
+        
         try:
-            if active:
+            if state == "active":
+                # Red - recording
                 color = NSColor.colorWithRed_green_blue_alpha_(*self.active_color)
                 self._view.setColor_(color)
                 self._window.orderFrontRegardless()
-                self._is_active = True
-            else:
-                if self.idle_color:
-                    color = NSColor.colorWithRed_green_blue_alpha_(*self.idle_color)
-                    self._view.setColor_(color)
-                    self._window.orderFrontRegardless()
-                else:
-                    self._window.orderOut_(None)
-                self._is_active = False
+            elif state == "processing":
+                # Yellow - processing between turns
+                color = NSColor.colorWithRed_green_blue_alpha_(*self.processing_color)
+                self._view.setColor_(color)
+                self._window.orderFrontRegardless()
+            elif state == "ready":
+                # Green - ready/idle
+                color = NSColor.colorWithRed_green_blue_alpha_(*self.ready_color)
+                self._view.setColor_(color)
+                self._window.orderFrontRegardless()
+            elif state is None:
+                # Hidden
+                self._window.orderOut_(None)
+            
+            self._current_state = state
         except Exception:
             pass
     
@@ -248,8 +273,10 @@ def create_indicator(config: Optional[dict] = None) -> PTTIndicator:
             - size: int (default 20)
             - position_x: int (default 20) 
             - position_y: int (default 20)
-            - active_color: [r, g, b, a] (default red)
-            - idle_color: [r, g, b, a] or null (default hidden)
+            - ready_color: [r, g, b, a] (default green) - app is running/idle
+            - active_color: [r, g, b, a] (default red) - recording
+            - processing_color: [r, g, b, a] (default yellow) - processing between turns
+            - idle_color: [r, g, b, a] or null (deprecated, use ready_color)
             - enabled: bool (default True)
     
     Returns:
@@ -262,12 +289,16 @@ def create_indicator(config: Optional[dict] = None) -> PTTIndicator:
     pos_x = config.get("position_x", 30)
     pos_y = config.get("position_y", 30)
     
-    active = config.get("active_color", [1.0, 0.2, 0.2, 0.95])
-    idle = config.get("idle_color", None)
+    ready = config.get("ready_color", [0.2, 0.8, 0.2, 0.9])  # Green
+    active = config.get("active_color", [1.0, 0.2, 0.2, 0.95])  # Red
+    processing = config.get("processing_color", [1.0, 0.8, 0.0, 0.9])  # Yellow
+    idle = config.get("idle_color", None)  # Backwards compat
     
     return PTTIndicator(
         size=size,
         position=(pos_x, pos_y),
+        ready_color=tuple(ready),
         active_color=tuple(active),
+        processing_color=tuple(processing),
         idle_color=tuple(idle) if idle else None,
     )

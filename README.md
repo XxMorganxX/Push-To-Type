@@ -12,7 +12,7 @@ https://github.com/yourusername/ptt-transcription
 
 - **🎯 Real-time transcription** - Text appears as you speak
 - **⌨️ Direct keyboard injection** - Works in any app (no clipboard interference)
-- **🔴 Visual indicator** - On-screen dot shows when recording
+- **🟢🔴🟡 Visual indicator** - On-screen dot shows app state (green=ready, red=recording, yellow=processing)
 - **🎨 Customizable keybinds** - Default: Left Shift + Right Shift
 - **📝 Smart punctuation** - Automatic word replacements (e.g., "slash" → "/")
 - **🚫 No clipboard pollution** - Uses paste mode with automatic clipboard restore
@@ -25,7 +25,10 @@ https://github.com/yourusername/ptt-transcription
 Hold [Left Shift + Right Shift] → Speak → Release → Text appears!
 ```
 
-The red indicator dot appears in the top-right when recording.
+**Indicator states:**
+- 🟢 **Green** - App is running and ready for input
+- 🔴 **Red** - Currently recording (PTT held)
+- 🟡 **Yellow** - Processing final transcription (between turns)
 
 ---
 
@@ -115,10 +118,11 @@ Edit `config.json` to customize:
   "indicator": {
     "enabled": true,
     "size": 16,
-    "position_x": 30,    // Pixels from right edge
-    "position_y": 30,    // Pixels from top
-    "active_color": [1.0, 0.2, 0.2, 0.95],  // RGBA (red)
-    "idle_color": null   // null = hidden when idle
+    "position_x": 30,                        // Pixels from right edge
+    "position_y": 30,                        // Pixels from top
+    "ready_color": [0.2, 0.8, 0.2, 0.9],     // RGBA green - app ready
+    "active_color": [1.0, 0.2, 0.2, 0.95],   // RGBA red - recording
+    "processing_color": [1.0, 0.8, 0.0, 0.9] // RGBA yellow - processing
   }
 }
 ```

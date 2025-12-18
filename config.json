@@ -10,8 +10,9 @@
     "size": 16,
     "position_x": 12,
     "position_y": 45,
+    "ready_color": [0.2, 0.8, 0.2, 0.9],
     "active_color": [1.0, 0.2, 0.2, 0.95],
-    "idle_color": null
+    "processing_color": [1.0, 0.8, 0.0, 0.9]
   },
   "keybinds": {
     "ptt": "leftshift+rightshift",
