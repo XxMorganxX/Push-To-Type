@@ -35,3 +35,5 @@ python main.py
 echo ""
 read -p "Press Enter to close..."
 
+
+
